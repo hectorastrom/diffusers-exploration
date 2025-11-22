@@ -34,7 +34,11 @@ def get_label_from_filename(filename: str) -> str:
 
 def image_label_generator(split_name: str):
     # Generators are memory efficient, lazy, and expected by datasets library
-    """Generator function to yield (image_path, label_name) pairs."""
+    """
+    Generator function to yield (image, label_name) pairs.
+    
+    Note that images are stored as image_paths, and decoded by datasets.
+    """
     # 'Train/Images' and 'Test/Images' structure
     split_path = os.path.join(DATASET_ROOT, split_name, "Image")
     
@@ -47,13 +51,13 @@ def image_label_generator(split_name: str):
             label_name = get_label_from_filename(filename)
             
             yield {
-                "image_path": file_path,
+                "image": file_path,
                 "label_name": label_name
             }
         else:
             print(f"Not an image (harmless, skipped): {filename}")
 
-def load_cod10k_lazy():
+def load_cod10k_lazy() -> DatasetDict:
     """
     Loads COD10K dataset with subclass as label. Lazy loading only loads
     filepaths, which are automatically decoded to images through datasets'
@@ -63,7 +67,7 @@ def load_cod10k_lazy():
     
     # schema is info datasets need to load image on demand from filepath
     features_schema = Features({
-        "image_path" : ImageFeature(),
+        "image" : ImageFeature(),
         "label_name": Value('string')
     })
     
@@ -106,3 +110,12 @@ def load_cod10k_lazy():
 dataset = load_cod10k_lazy()
 print("Success! Dataset loaded")
 print(dataset['train'].features)
+print(dataset['train'][0])
+
+##################################
+# Rendering images from dset
+##################################
+
+def transform_fn(samples):
+    """Method to run on-the-fly for CLIP classifier"""
+    images = [x.convert('RGB') for x in samples['image']]
