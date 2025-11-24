@@ -113,53 +113,57 @@ def load_cod10k_lazy() -> DatasetDict:
     
     return final_dataset
 
-hf_dataset = load_cod10k_lazy()
-print("Success! Dataset loaded")
-print(hf_dataset['train'].features)
-print(hf_dataset['train'][0])
+if __name__ == "__main__":
+    hf_dataset = load_cod10k_lazy()
+    print("Success! Dataset loaded")
+    print(hf_dataset['train'].features)
+    print(hf_dataset['train'][0])
 
-##################################
-# Rendering images from dset
-##################################
-TARGET_SIZE = (512, 512)
-img_transform = transforms.Compose([
-    transforms.Resize(TARGET_SIZE),
-    transforms.ToTensor()
-])
+    ##################################
+    # Rendering images from dset
+    ##################################
+    TARGET_SIZE = (512, 512)
+    tensor_transform = transforms.Compose([
+        transforms.Resize(TARGET_SIZE),
+        transforms.ToTensor()
+    ])
 
-def transform_fn(sample):
-    """Method to run on-the-fly for CLIP classifier"""
-    img = sample['image']
-    img = img.convert("RGB")
-    img = img_transform(img)
-    sample['image'] = img
-    return sample
+    def pytorch_transform_fn(example):
+        # Check if we are handling a single item (dict) or a batch (dict of lists)
+        # Add pixel_values col for training with torch. o.w. CLIP expects full PIL images
+        if isinstance(example['image'], list):
+            # Handle batch 
+            example['pixel_values'] = [tensor_transform(img.convert("RGB")) for img in example['image']]
+        else:
+            # Handle single item 
+            example['pixel_values'] = tensor_transform(example['image'].convert("RGB"))
+        return example
     
-BATCH_SIZE = 16    
+    hf_dataset.set_transform(pytorch_transform_fn) # runs lazily when accessed
+      
+    # not needed rn - would've been for training  
+    # BATCH_SIZE = 16    
+    # train_loader = DataLoader(hf_dataset["train"], batch_size=BATCH_SIZE, shuffle=True)
+    # test_loader = DataLoader(hf_dataset['test'], batch_size=BATCH_SIZE, shuffle=True)
 
-print("Transforming images for dataloader...")
-hf_dataset = hf_dataset.map(
-    transform_fn,
-    num_proc=3
-)
-print("Resized images!")
+    clip = pipeline(
+        task="zero-shot-image-classification",
+        model="openai/clip-vit-base-patch32",
+        dtype=t.bfloat16,
+        device=0
+    )
+    
+    class_features = hf_dataset['train'].features['label'] # ClassLabel mapper
+    # one sample
+    example = hf_dataset['train'][0]
+    pil_img = example['image']
+    label_int = example['label']
+    label_str = class_features.int2str(label_int)
+    
+    print(f"{label_int=}, {label_str=}")
 
-hf_dataset.set_format('torch', columns=['image', 'label'])
-train_loader = DataLoader(hf_dataset["train"], batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(hf_dataset['test'], batch_size=BATCH_SIZE, shuffle=True)
-
-clip = pipeline(
-    task="zero-shot-image-classification",
-    model="openai/clip-vit-base-patch32",
-    dtype=t.bfloat16,
-    device=0
-)
-
-for batch in train_loader:
-    x, y = batch['image'], batch['label']
-    print(x)
-    print(y)
-    label = f"An image of {y}"
-    score = clip(x, [label])[0]['score']
-    break
+    candidate_labels = [f"An image of {label}" for label in class_features.names]
+    
+    result = clip(pil_img, candidate_labels)
+    print(result)
     
