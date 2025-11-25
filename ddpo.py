@@ -404,23 +404,36 @@ class ImageDDPOTrainer(DDPOTrainer):
     def __init__(self, *args, noise_strength=0.2, debug_hook=None, **kwargs):
         self.noise_strength = noise_strength
         self.debug_hook = debug_hook
+        
+        # We must align the DDPOTrainer's idea of trajectory length with the I2I pipeline's reality.
+        # DDPOTrainer uses config.train_timestep_fraction to set up the Accelerator's 
+        # gradient accumulation. If this is mismatched, the accelerator will either 
+        # never sync (your error) or sync at wrong intervals.
+        
+        config = kwargs.get('config')
+        if config:
+            total_steps = config.sample_num_steps
+            
+            # Logic mirrored from i2i_pipeline_step:
+            # We must compute the exact integer length that the pipeline will produce.
+            start_idx = int(total_steps * (1 - noise_strength))
+            start_idx = max(0, min(start_idx, total_steps - 1))
+            expected_steps = total_steps - start_idx
+            
+            # Patch the fraction so DDPOTrainer calculates the correct integer steps
+            # Add small epsilon to handle float precision issues
+            config.train_timestep_fraction = (expected_steps / total_steps) + 1e-9
+        
         super().__init__(*args, **kwargs)
-        
-        # NOTE: self.num_train_timesteps is used by DDPOTrainer to calculate
-        # gradient_accumulation_steps for the accelerator. 
-        # By shortening the actual trajectory length below, we are effectively 
-        # accumulating gradients over *more* images than configured (since each image 
-        # contributes fewer steps). This is generally fine for RL stability.
-        
-        # We update this here so it reflects the I2I reality for logging/reference,
-        # though the Accelerator is already initialized by super().__init__.
-        self.num_train_timesteps = int(self.config.sample_num_steps * self.noise_strength)
 
     def _generate_samples(self, iterations, batch_size):
         """
-        Modified to support Image inputs. No padding for shorter I2I
-        trajectories (like we did previously).
+        Only overridden to:
+        1. Handle Image Inputs
+        2. Return UNPADDED trajectories (so shapes match the shortened training loop)
+        3. Slice timesteps correctly (fixing your crash)
         """
+        # ... (Same setup code as before for hooks/wandb) ...
         current_step = wandb.run.step if wandb.run is not None else 0
         if self.debug_hook is not None and self.accelerator.is_main_process:
             self.debug_hook(self.sd_pipeline, self.noise_strength, current_step)
@@ -441,7 +454,6 @@ class ImageDDPOTrainer(DDPOTrainer):
             input_images = torch.stack(input_images).to(
                 self.accelerator.device, dtype=self.sd_pipeline.vae.dtype
             )
-            
             input_images = 2.0 * input_images - 1.0
 
             prompt_ids = self.sd_pipeline.tokenizer(
@@ -454,13 +466,10 @@ class ImageDDPOTrainer(DDPOTrainer):
             prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
 
             with self.autocast():
-                # 2. ENCODE IMAGES (VAE)
-                init_latents = self.sd_pipeline.vae.encode(
-                    input_images
-                ).latent_dist.sample()
+                # 2. ENCODE & NOISE
+                init_latents = self.sd_pipeline.vae.encode(input_images).latent_dist.sample()
                 init_latents = init_latents * 0.18215
 
-                # 3. ADD NOISE
                 max_timesteps = self.sd_pipeline.scheduler.config.num_train_timesteps
                 t_start = int(max_timesteps * self.noise_strength)
 
@@ -472,7 +481,7 @@ class ImageDDPOTrainer(DDPOTrainer):
                     init_latents, noise, timesteps
                 )
 
-                # 4. RUN PIPELINE
+                # 3. RUN PIPELINE
                 sd_output = self.sd_pipeline(
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=sample_neg_prompt_embeds,
@@ -484,37 +493,15 @@ class ImageDDPOTrainer(DDPOTrainer):
                     starting_step_ratio=self.noise_strength,
                 )
 
+                latents = torch.stack(sd_output.latents, dim=1)
+                log_probs = torch.stack(sd_output.log_probs, dim=1)
                 images = sd_output.images
-                latents = sd_output.latents     # list length = 1 + effective_steps
-                log_probs = sd_output.log_probs # list length = effective_steps
 
-            # Convert lists to tensors
-            latents = torch.stack(latents, dim=1)      # (B, num_effective+1, C, H, W)
-            log_probs = torch.stack(log_probs, dim=1)  # (B, num_effective)
-
-            # --- KEY CHANGE: NO PADDING ---
-            # We treat the I2I trajectory as the "full" trajectory.
-            # We must retrieve the specific subset of timesteps used during sampling.
-            # The pipeline calculated these based on starting_step_ratio.
-            
-            # The scheduler's timesteps array currently holds the sequence used 
-            # in the last call. It should match log_probs length.
-            # Note: scheduler.timesteps is usually [981, 961, ..., 1]
-            # We just need to repeat it for the batch.
-            timesteps_tensor = self.sd_pipeline.scheduler.timesteps.to(self.accelerator.device)
-            
-            # Safety check to ensure shapes align
-            if timesteps_tensor.shape[0] != log_probs.shape[1]:
-                 # Fallback if scheduler state is somehow desynced (unlikely in this flow)
-                 # Re-calculate indices based on noise_strength logic
-                 full_timesteps = self.sd_pipeline.scheduler.config.num_train_timesteps # 1000
-                 step_ratio = int(full_timesteps / self.config.sample_num_steps) # 20
-                 start_step = int(full_timesteps * self.noise_strength) # 200
-                 # We want [200, 180, ..., 0] (approx) - standard schedulers vary
-                 # Ideally, we trust the pipeline left the correct timesteps in the scheduler
-                 pass
-
-            timesteps = timesteps_tensor.repeat(batch_size, 1)
+            # 4. FIX TIMESTEPS SIZE
+            # The scheduler holds all 50 timesteps. We only want the last N executed steps.
+            actual_num_steps = log_probs.shape[1]
+            full_timesteps = self.sd_pipeline.scheduler.timesteps.to(self.accelerator.device)
+            timesteps = full_timesteps[-actual_num_steps:].repeat(batch_size, 1)
 
             samples.append(
                 {
@@ -530,53 +517,3 @@ class ImageDDPOTrainer(DDPOTrainer):
             prompt_image_pairs.append([images, prompts, prompt_metadata])
 
         return samples, prompt_image_pairs
-
-    def _train_batched_samples(self, inner_epoch, epoch, global_step, batched_samples):
-        """
-        Override to support dynamic trajectory lengths (iterating over shape[1] 
-        instead of self.num_train_timesteps).
-        """
-        info = defaultdict(list)
-        for _i, sample in enumerate(batched_samples):
-            if self.config.train_cfg:
-                embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
-            else:
-                embeds = sample["prompt_embeds"]
-
-            # KEY CHANGE: Dynamic iteration based on actual sample length
-            # sample["log_probs"] is (B, T)
-            actual_num_timesteps = sample["log_probs"].shape[1]
-            
-            for j in range(actual_num_timesteps):
-                with self.accelerator.accumulate(self.sd_pipeline.unet):
-                    loss, approx_kl, clipfrac = self.calculate_loss(
-                        sample["latents"][:, j],
-                        sample["timesteps"][:, j],
-                        sample["next_latents"][:, j],
-                        sample["log_probs"][:, j],
-                        sample["advantages"],
-                        embeds,
-                    )
-                    info["approx_kl"].append(approx_kl)
-                    info["clipfrac"].append(clipfrac)
-                    info["loss"].append(loss)
-
-                    self.accelerator.backward(loss)
-                    if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(
-                            self.trainable_layers.parameters()
-                            if not isinstance(self.trainable_layers, list)
-                            else self.trainable_layers,
-                            self.config.train_max_grad_norm,
-                        )
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-
-                if self.accelerator.sync_gradients:
-                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                    info = self.accelerator.reduce(info, reduction="mean")
-                    info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                    self.accelerator.log(info, step=global_step)
-                    global_step += 1
-                    info = defaultdict(list)
-        return global_step
