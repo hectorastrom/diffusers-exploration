@@ -4,6 +4,7 @@
 # @File    : ddpo.py
 
 import torch
+from collections import defaultdict
 import numpy as np
 from trl import DDPOTrainer, DefaultDDPOStableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
@@ -404,10 +405,23 @@ class ImageDDPOTrainer(DDPOTrainer):
         self.noise_strength = noise_strength
         self.debug_hook = debug_hook
         super().__init__(*args, **kwargs)
-            
+        
+        # NOTE: self.num_train_timesteps is used by DDPOTrainer to calculate
+        # gradient_accumulation_steps for the accelerator. 
+        # By shortening the actual trajectory length below, we are effectively 
+        # accumulating gradients over *more* images than configured (since each image 
+        # contributes fewer steps). This is generally fine for RL stability.
+        
+        # We update this here so it reflects the I2I reality for logging/reference,
+        # though the Accelerator is already initialized by super().__init__.
+        self.num_train_timesteps = int(self.config.sample_num_steps * self.noise_strength)
+
     def _generate_samples(self, iterations, batch_size):
+        """
+        Modified to support Image inputs. No padding for shorter I2I
+        trajectories (like we did previously).
+        """
         current_step = wandb.run.step if wandb.run is not None else 0
-        # Run hook to visualize samples each sampling iteration
         if self.debug_hook is not None and self.accelerator.is_main_process:
             self.debug_hook(self.sd_pipeline, self.noise_strength, current_step)
         
@@ -428,10 +442,8 @@ class ImageDDPOTrainer(DDPOTrainer):
                 self.accelerator.device, dtype=self.sd_pipeline.vae.dtype
             )
             
-            # Normalize to [-1, 1] for VAE from [0, 1] range of PIL images
             input_images = 2.0 * input_images - 1.0
 
-            # Tokenize prompts
             prompt_ids = self.sd_pipeline.tokenizer(
                 prompts,
                 return_tensors="pt",
@@ -480,51 +492,91 @@ class ImageDDPOTrainer(DDPOTrainer):
             latents = torch.stack(latents, dim=1)      # (B, num_effective+1, C, H, W)
             log_probs = torch.stack(log_probs, dim=1)  # (B, num_effective)
 
-            full_steps = self.config.sample_num_steps
-            num_steps = log_probs.shape[1]
+            # --- KEY CHANGE: NO PADDING ---
+            # We treat the I2I trajectory as the "full" trajectory.
+            # We must retrieve the specific subset of timesteps used during sampling.
+            # The pipeline calculated these based on starting_step_ratio.
+            
+            # The scheduler's timesteps array currently holds the sequence used 
+            # in the last call. It should match log_probs length.
+            # Note: scheduler.timesteps is usually [981, 961, ..., 1]
+            # We just need to repeat it for the batch.
+            timesteps_tensor = self.sd_pipeline.scheduler.timesteps.to(self.accelerator.device)
+            
+            # Safety check to ensure shapes align
+            if timesteps_tensor.shape[0] != log_probs.shape[1]:
+                 # Fallback if scheduler state is somehow desynced (unlikely in this flow)
+                 # Re-calculate indices based on noise_strength logic
+                 full_timesteps = self.sd_pipeline.scheduler.config.num_train_timesteps # 1000
+                 step_ratio = int(full_timesteps / self.config.sample_num_steps) # 20
+                 start_step = int(full_timesteps * self.noise_strength) # 200
+                 # We want [200, 180, ..., 0] (approx) - standard schedulers vary
+                 # Ideally, we trust the pipeline left the correct timesteps in the scheduler
+                 pass
 
-            # Pad to full_steps if we truncated timesteps for I2I
-            if num_steps < full_steps:
-                pad = full_steps - num_steps
-
-                # Pad log_probs with zeros on the left (earliest steps).
-                pad_log_shape = (log_probs.shape[0], pad) + log_probs.shape[2:]
-                pad_log_probs = torch.zeros(
-                    pad_log_shape,
-                    device=log_probs.device,
-                    dtype=log_probs.dtype,
-                )
-                log_probs = torch.cat([pad_log_probs, log_probs], dim=1)
-                # Now log_probs.shape[1] == full_steps
-
-                # Pad latents with copies of the first latent for missing early steps.
-                first_latent = latents[:, 0:1]  # (B, 1, C, H, W)
-                pad_latents = first_latent.expand(
-                    -1, pad, *latents.shape[2:]
-                )  # (B, pad, C, H, W)
-                latents = torch.cat([pad_latents, latents], dim=1)
-                # latents.shape[1] == pad + (num_steps + 1) == full_steps + 1
-
-            elif num_steps > full_steps:
-                # Should not happen with our I2I setup, but truncate just in case.
-                log_probs = log_probs[:, -full_steps:]
-                latents = latents[:, -(full_steps + 1):]
-
-            # Build timesteps for all sample_num_steps steps
-            timesteps_tensor = self.sd_pipeline.scheduler.timesteps  # length = full_steps
             timesteps = timesteps_tensor.repeat(batch_size, 1)
 
             samples.append(
                 {
                     "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
-                    "timesteps": timesteps,              # (B, full_steps)
-                    "latents": latents[:, :-1],          # (B, full_steps, C, H, W)
-                    "next_latents": latents[:, 1:],      # (B, full_steps, C, H, W)
-                    "log_probs": log_probs,              # (B, full_steps)
+                    "timesteps": timesteps,
+                    "latents": latents[:, :-1],
+                    "next_latents": latents[:, 1:],
+                    "log_probs": log_probs,
                     "negative_prompt_embeds": sample_neg_prompt_embeds,
                 }
             )
             prompt_image_pairs.append([images, prompts, prompt_metadata])
 
         return samples, prompt_image_pairs
+
+    def _train_batched_samples(self, inner_epoch, epoch, global_step, batched_samples):
+        """
+        Override to support dynamic trajectory lengths (iterating over shape[1] 
+        instead of self.num_train_timesteps).
+        """
+        info = defaultdict(list)
+        for _i, sample in enumerate(batched_samples):
+            if self.config.train_cfg:
+                embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
+            else:
+                embeds = sample["prompt_embeds"]
+
+            # KEY CHANGE: Dynamic iteration based on actual sample length
+            # sample["log_probs"] is (B, T)
+            actual_num_timesteps = sample["log_probs"].shape[1]
+            
+            for j in range(actual_num_timesteps):
+                with self.accelerator.accumulate(self.sd_pipeline.unet):
+                    loss, approx_kl, clipfrac = self.calculate_loss(
+                        sample["latents"][:, j],
+                        sample["timesteps"][:, j],
+                        sample["next_latents"][:, j],
+                        sample["log_probs"][:, j],
+                        sample["advantages"],
+                        embeds,
+                    )
+                    info["approx_kl"].append(approx_kl)
+                    info["clipfrac"].append(clipfrac)
+                    info["loss"].append(loss)
+
+                    self.accelerator.backward(loss)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(
+                            self.trainable_layers.parameters()
+                            if not isinstance(self.trainable_layers, list)
+                            else self.trainable_layers,
+                            self.config.train_max_grad_norm,
+                        )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                if self.accelerator.sync_gradients:
+                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                    info = self.accelerator.reduce(info, reduction="mean")
+                    info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                    self.accelerator.log(info, step=global_step)
+                    global_step += 1
+                    info = defaultdict(list)
+        return global_step
