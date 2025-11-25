@@ -137,14 +137,20 @@ if __name__ == "__main__":
                 starting_step_ratio=noise_strength
             )   
             
-            after_img = output.images[0]
+            after_img = output.images[0] # (H, W, C)
+        
+        
+        after_img_tensor = torch.from_numpy(np.array(after_img)).permute(2, 0, 1).unsqueeze(0).float()
+    
+        # Calculate the reward on the *after* image
+        # reward_fn expects a (B, C, H, W) tensor, and metadata as a list of dicts
+        val_reward, _ = reward_fn(after_img_tensor, [val_prompt], [val_meta])
+        val_reward = val_reward.item()
         
         # prepare before image
         # (H, W, C) - this should be in [0, 1] range by default so might be overkill
         before_img = input_image.clone().detach().cpu().squeeze(0).permute(1, 2, 0).numpy()
         
-        batched_before = np.expand_dims(before_img, axis=0) # for reward fn
-        val_reward = reward_fn(batched_before, [val_prompt], [val_meta])
         wandb.log({
             "validation/before_vs_after": [
                 wandb.Image(before_img, caption=f"Before (Label: {val_meta['label_str']})"),
