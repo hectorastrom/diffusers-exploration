@@ -141,7 +141,7 @@ def validation_hook(pipeline, noise_strength, wandb_step):
     wandb.log({
         "validation/before_vs_after": [
             wandb.Image(before_img, caption=f"Before (Label: {val_meta['label_str']})"),
-            wandb.Image(after_img, caption=f"After (prompt={val_prompt}, r={val_reward:.2f})")
+            wandb.Image(after_img, caption=f"After (RL, prompt={val_prompt}, r={val_reward:.2f})")
         ]
     }, step=wandb_step)
 
