@@ -177,22 +177,34 @@ def scheduler_step(
             -self.config.clip_sample_range, self.config.clip_sample_range
         )
 
-    # Compute variance on the scheduler's native device, then broadcast back
+   # Compute variance
     variance = _get_variance(self, timestep, prev_timestep)
+
+    # Branch for deterministic / zero-variance steps
+    deterministic_step = (eta == 0.0) or torch.all(variance.abs() < 1e-20)
+
+    if deterministic_step:
+        # Standard DDIM deterministic update
+        pred_sample_direction = (1 - alpha_prod_t_prev) ** 0.5 * pred_epsilon
+        prev_sample_mean = alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
+
+        if prev_sample is None:
+            prev_sample = prev_sample_mean
+
+        # No stochasticity => no meaningful log-prob increment
+        log_prob = torch.zeros(sample.shape[0], device=device, dtype=sample.dtype)
+        return DDPOSchedulerOutput(prev_sample.type(sample.dtype), log_prob)
+
+    # Stochastic branch (eta > 0 and variance > 0)
+    variance = torch.clamp(variance, min=1e-20)
     std_dev_t = eta * variance ** 0.5
     std_dev_t = _left_broadcast(std_dev_t, sample.shape).to(device)
 
     if use_clipped_model_output:
-        pred_epsilon = (
-            sample - alpha_prod_t ** 0.5 * pred_original_sample
-        ) / beta_prod_t ** 0.5
+        pred_epsilon = (sample - alpha_prod_t ** 0.5 * pred_original_sample) / beta_prod_t ** 0.5
 
-    pred_sample_direction = (
-        1 - alpha_prod_t_prev - std_dev_t ** 2
-    ) ** 0.5 * pred_epsilon
-    prev_sample_mean = (
-        alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
-    )
+    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t ** 2) ** 0.5 * pred_epsilon
+    prev_sample_mean = alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
 
     if prev_sample is None:
         variance_noise = torch.randn(
@@ -206,7 +218,7 @@ def scheduler_step(
     log_prob = (
         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t ** 2))
         - torch.log(std_dev_t)
-        - torch.log(torch.sqrt(2 * torch.as_tensor(np.pi)))
+        - torch.log(torch.sqrt(2 * torch.as_tensor(np.pi, device=device, dtype=sample.dtype)))
     )
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
@@ -276,17 +288,25 @@ def i2i_pipeline_step(
     timesteps = timesteps[start_idx:]
 
     # 5. Prepare latent variables
+    # Fix: avoiding double scaling, since noisy latents are already scaled
+    # inside _generate_samples
     num_channels_latents = self.unet.config.in_channels
-    latents = self.prepare_latents(
-        batch_size * num_images_per_prompt,
-        num_channels_latents,
-        height,
-        width,
-        prompt_embeds.dtype,
-        device,
-        generator,
-        latents,
-    )
+
+    if latents is None:
+        # Fallback: behave like text-only sampling
+        shape = (
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height // self.vae_scale_factor,
+            width // self.vae_scale_factor,
+        )
+        latents = torch.randn(
+            shape, generator=generator, device=device, dtype=prompt_embeds.dtype
+        )
+        latents = latents * self.scheduler.init_noise_sigma
+    else:
+        # For I2I we assume latents are already correctly scaled and noised
+        latents = latents.to(device=device, dtype=prompt_embeds.dtype)
 
     # 6. Denoising loop
     all_latents = [latents]

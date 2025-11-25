@@ -125,7 +125,7 @@ def validation_hook(pipeline, noise_strength, wandb_step):
             output_type="pil",
             latents=noisy_latents,
             starting_step_ratio=noise_strength
-        )
+        )   
         
         after_img = output.images[0]
     
