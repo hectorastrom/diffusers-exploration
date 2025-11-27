@@ -58,24 +58,26 @@ def _get_variance(self, timestep, prev_timestep):
     timestep = timestep.to(device)
     prev_timestep = prev_timestep.to(device)
 
-    # Make sure gather sees 1D index tensors
-    if timestep.dim() == 0:
-        timestep = timestep.unsqueeze(0)
-    if prev_timestep.dim() == 0:
-        prev_timestep = prev_timestep.unsqueeze(0)
+    if not torch.is_tensor(timestep):
+        timestep = torch.tensor([timestep], device=device, dtype=torch.long)
+    else:
+        timestep = timestep.to(device).long().reshape(-1)
 
-    timestep = timestep.long()
-    prev_timestep = prev_timestep.long()
+    if not torch.is_tensor(prev_timestep):
+        prev_timestep = torch.tensor([prev_timestep], device=device, dtype=torch.long)
+    else:
+        prev_timestep = prev_timestep.to(device).long().reshape(-1)
 
     alphas_cumprod = self.alphas_cumprod.to(device)
     final_alpha_cumprod = self.final_alpha_cumprod.to(device)
 
     alpha_prod_t = torch.gather(alphas_cumprod, 0, timestep)
-    alpha_prod_t_prev = torch.where(
-        prev_timestep >= 0,
-        torch.gather(alphas_cumprod, 0, prev_timestep),
-        final_alpha_cumprod,
-    )
+
+    prev_mask = prev_timestep >= 0
+    prev_timestep_clipped = prev_timestep.clamp_min(0)
+
+    alpha_prod_t_prev_raw = torch.gather(alphas_cumprod, 0, prev_timestep_clipped)
+    alpha_prod_t_prev = torch.where(prev_mask, alpha_prod_t_prev_raw, final_alpha_cumprod)
 
     beta_prod_t = 1 - alpha_prod_t
     beta_prod_t_prev = 1 - alpha_prod_t_prev
@@ -118,30 +120,27 @@ def scheduler_step(
     else:
         timestep = timestep.to(device)
 
-    # Compute previous timestep in the same shape as timestep
-    prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
-    prev_timestep = torch.clamp(
-        prev_timestep, 0, self.config.num_train_timesteps - 1
-    )
+    prev_offset = self.config.num_train_timesteps // self.num_inference_steps
 
-    # Ensure 1D long tensors so torch.gather works for both scalar and batched cases
-    if timestep.dim() == 0:
-        timestep = timestep.unsqueeze(0)
-    if prev_timestep.dim() == 0:
-        prev_timestep = prev_timestep.unsqueeze(0)
+    # Normalize timestep to 1-D long tensor on the right device
+    if not torch.is_tensor(timestep):
+        timestep = torch.tensor([timestep], device=device, dtype=torch.long)
+    else:
+        timestep = timestep.to(device).long().reshape(-1)  # (N,)
 
-    timestep = timestep.long()
-    prev_timestep = prev_timestep.long()
+    prev_timestep = timestep - prev_offset  # may be negative
 
     alphas_cumprod = self.alphas_cumprod.to(device)
-    final_alpha_cumprod = self.final_alpha_cumprod.to(device)
+    final_alpha_cumprod = self.final_alpha_cumprod.to(device)  # scalar
 
-    alpha_prod_t = torch.gather(alphas_cumprod, 0, timestep)
-    alpha_prod_t_prev = torch.where(
-        prev_timestep >= 0,
-        torch.gather(alphas_cumprod, 0, prev_timestep),
-        final_alpha_cumprod,
-    )
+    # Mask which prev indices are valid
+    prev_mask = prev_timestep >= 0             # (N,)
+    prev_timestep_clipped = prev_timestep.clamp_min(0)  # (N,)
+
+    # Gather current and previous alpha products
+    alpha_prod_t = torch.gather(alphas_cumprod, 0, timestep)                  # (N,)
+    alpha_prod_t_prev_raw = torch.gather(alphas_cumprod, 0, prev_timestep_clipped)  # (N,)
+    alpha_prod_t_prev = torch.where(prev_mask, alpha_prod_t_prev_raw, final_alpha_cumprod)
 
     alpha_prod_t = _left_broadcast(alpha_prod_t, sample.shape).to(device)
     alpha_prod_t_prev = _left_broadcast(alpha_prod_t_prev, sample.shape).to(device)
@@ -178,7 +177,7 @@ def scheduler_step(
             -self.config.clip_sample_range, self.config.clip_sample_range
         )
 
-   # Compute variance
+    # Compute variance
     variance = _get_variance(self, timestep, prev_timestep)
 
     # Branch for deterministic / zero-variance steps
@@ -404,26 +403,6 @@ class ImageDDPOTrainer(DDPOTrainer):
     def __init__(self, *args, noise_strength=0.2, debug_hook=None, **kwargs):
         self.noise_strength = noise_strength
         self.debug_hook = debug_hook
-        
-        # We must align the DDPOTrainer's idea of trajectory length with the I2I pipeline's reality.
-        # DDPOTrainer uses config.train_timestep_fraction to set up the Accelerator's 
-        # gradient accumulation. If this is mismatched, the accelerator will either 
-        # never sync (your error) or sync at wrong intervals.
-        
-        config = kwargs.get('config')
-        if config:
-            total_steps = config.sample_num_steps
-            
-            # Logic mirrored from i2i_pipeline_step:
-            # We must compute the exact integer length that the pipeline will produce.
-            start_idx = int(total_steps * (1 - noise_strength))
-            start_idx = max(0, min(start_idx, total_steps - 1))
-            expected_steps = total_steps - start_idx
-            
-            # Patch the fraction so DDPOTrainer calculates the correct integer steps
-            # Add small epsilon to handle float precision issues
-            config.train_timestep_fraction = (expected_steps / total_steps) + 1e-9
-        
         super().__init__(*args, **kwargs)
 
     def _generate_samples(self, iterations, batch_size):
@@ -433,11 +412,10 @@ class ImageDDPOTrainer(DDPOTrainer):
         2. Return UNPADDED trajectories (so shapes match the shortened training loop)
         3. Slice timesteps correctly (fixing your crash)
         """
-        # ... (Same setup code as before for hooks/wandb) ...
         current_step = wandb.run.step if wandb.run is not None else 0
         if self.debug_hook is not None and self.accelerator.is_main_process:
             self.debug_hook(self.sd_pipeline, self.noise_strength, current_step)
-        
+
         samples = []
         prompt_image_pairs = []
 
@@ -454,6 +432,8 @@ class ImageDDPOTrainer(DDPOTrainer):
             input_images = torch.stack(input_images).to(
                 self.accelerator.device, dtype=self.sd_pipeline.vae.dtype
             )
+
+            # takes [0,1]->[-1,1] - i've confirmed images range from [0, 1].
             input_images = 2.0 * input_images - 1.0
 
             prompt_ids = self.sd_pipeline.tokenizer(

@@ -8,6 +8,8 @@ import torchvision.transforms.functional as TF
 from transformers import pipeline
 from typing import Any, List, Dict
 
+eps = 1e-6
+
 class CLIPReward:
     def __init__(self, class_names: List[str], device: str | int = 0):
         """
@@ -15,9 +17,9 @@ class CLIPReward:
         """
         self.device = device
         self.class_names = class_names
-        
+
         print(f"Loading CLIP and caching {len(class_names)} class embeddings...")
-        
+
         self.clip_pipe = pipeline(
             task="zero-shot-image-classification",
             model="openai/clip-vit-base-patch32",
@@ -25,19 +27,20 @@ class CLIPReward:
             use_fast=True,
             device=device
         )
-        
+
         # Cache Text Embeddings
         prompts = [f"An image of {label}" for label in class_names]
-        
+
         tokenizer = self.clip_pipe.tokenizer
         model = self.clip_pipe.model
-        
+
         inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
-        
+
         with torch.no_grad():
             text_features = model.get_text_features(**inputs)
-            self.cached_text_embeds = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
-            
+            norms = text_features.norm(p=2, dim=-1, keepdim=True)
+            self.cached_text_embeds = text_features / (norms + eps)
+
         print("CLIP initialized and embeddings cached.")
 
     def __call__(self, images: torch.Tensor, prompts: List[str], metadata: List[Dict[str, Any]]) -> tuple[torch.Tensor, Dict[str, Any]]:
@@ -52,7 +55,7 @@ class CLIPReward:
             reward_metadata: Dict (Empty)
         """
         batch_size = images.shape[0]
-        
+
         # Extract labels from metadata
         # metadata is a list of dicts: [{'label': 5}, {'label': 2}...]
         labels = torch.tensor([m["label"] for m in metadata], device=self.device)
@@ -70,12 +73,13 @@ class CLIPReward:
             images=pil_images, 
             return_tensors="pt"
         ).to(self.clip_pipe.model.device)
-        
+
         with torch.no_grad():
             # 3. Get Image Embeddings & Normalize
             image_features = self.clip_pipe.model.get_image_features(**image_inputs)
-            image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
-            
+            norms = image_features.norm(p=2, dim=-1, keepdim=True)
+            image_features = image_features / (norms + eps)
+
             # 4. Cosine Similarity -> Logits -> Probs
             logit_scale = self.clip_pipe.model.logit_scale.exp()
             logits = logit_scale * (image_features @ self.cached_text_embeds.t())
@@ -83,11 +87,13 @@ class CLIPReward:
 
             # 5. Gather specific label confidence
             labels = labels.to(probs.device)
-            rewards = probs[torch.arange(batch_size, device=probs.device), labels]
+            rewards = probs[torch.arange(batch_size, device=probs.device), labels].to(torch.float32)
+            rewards = torch.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
         # DDPOTrainer/Accelerate will call .cpu().numpy() on rewards.
         # NumPy does not support bfloat16, so we convert to float32 here.
         rewards = rewards.to(torch.float32)
-        
+
         # Return a tuple (reward_tensor, metadata_dict)
+        print(f"Avg reward for {len(rewards)} images: {rewards.mean()}")
         return rewards, {}

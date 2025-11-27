@@ -19,7 +19,7 @@ from trl import DDPOConfig
 from ddpo import ImageDDPOTrainer, I2IDDPOStableDiffusionPipeline
 from reward import CLIPReward
 from COD_dataset import build_COD_torch_dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import numpy as np
 import os
 import torch
@@ -29,7 +29,7 @@ import wandb
 # Constants
 ##################################
 LOADER_BATCH_SIZE = 16 # limited by CPU - faster to fetch many at once
-GPU_BATCH_SIZE = 8 # limited by VRAM
+GPU_BATCH_SIZE = 4 # limited by VRAM
 # TODO: Play around with what prompt works best! Can't be class dependent
 PROMPT = ""
 NUM_WORKERS = 1
@@ -44,8 +44,10 @@ if __name__ == "__main__":
     ##################################
     # Construct dataset
     ##################################
+    # FIXME: Only using 16 images to try overfitting / reward hacking. If this doesn't work we're cooked
     dataset = build_COD_torch_dataset('train')
-    train_loader = DataLoader(dataset, batch_size=LOADER_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    overfit_dataset = Subset(dataset, torch.arange(16)) # first 16 samples
+    train_loader = DataLoader(overfit_dataset, batch_size=LOADER_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
 
     # (called as ... = [self.prompt_fn() for _ in range(batch_size)])
     def create_data_generator(dataloader, prompt):
@@ -140,7 +142,8 @@ if __name__ == "__main__":
             after_img = output.images[0] # (H, W, C)
         
         
-        after_img_tensor = torch.from_numpy(np.array(after_img)).permute(2, 0, 1).unsqueeze(0).float()
+        # pixels go up to 255 -> want them at 0 to 1
+        after_img_tensor = torch.from_numpy(np.array(after_img)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
     
         # Calculate the reward on the *after* image
         # reward_fn expects a (B, C, H, W) tensor, and metadata as a list of dicts
@@ -154,7 +157,7 @@ if __name__ == "__main__":
         wandb.log({
             "validation/before_vs_after": [
                 wandb.Image(before_img, caption=f"Before (Label: {val_meta['label_str']})"),
-                wandb.Image(after_img, caption=f"After (RL, prompt={val_prompt}, r={val_reward:.2f})")
+                wandb.Image(after_img, caption=f"After (RL, prompt='{val_prompt}', r={val_reward:.4f})")
             ]
         }, step=wandb_step)
 
@@ -172,6 +175,10 @@ if __name__ == "__main__":
         # --- Sampling (Experience Collection) ---
         # Total samples per epoch = batch_size * num_batches * num_processes.
         # RL requires a decent "buffer" of experiences to learn effectively.
+        # num_train_timesteps = sample_num_steps * train_timestep_fraction 
+        # Since we only want to do last NOISE_STRENGTH fraction of inference 
+        # steps, we select train_timestep_fraction to be exactly NOISE_STRENGTH
+        train_timestep_fraction=NOISE_STRENGTH, 
         sample_num_steps=SAMPLE_NUM_STEPS,
         sample_batch_size=GPU_BATCH_SIZE,           
         sample_num_batches_per_epoch=SAMPLE_BATCHES_PER_EPOCH, # steps * num batches = total samples / epoch
