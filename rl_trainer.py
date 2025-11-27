@@ -68,18 +68,25 @@ if __name__ == "__main__":
                     image = images[i].to(DEVICE)
                     label = labels[i].item()
                     
+                    # unique identifier to work with per_prompt_stat_tracking
+                    unique_id = f"{dataset.label2str(label)}_{i}" # e.g. 'seahorse_3'
+                    
                     # 3 necessary return items
                     metadata = {
                         "label": label,
                         "label_str": dataset.label2str(label),
-                        "original_image": image.clone()
+                        "original_image": image.clone(),
+                        "unique_id": unique_id
                     }
                     
                     if prompt == "ORACLE":
                         prompt = f"A clear photo of {dataset.label2str(label)}"
                     
+                    # always add id
+                    prompt_str = f"{prompt} id:{unique_id}"
+                    
                     # prompt + image are analogous to just prompt within DDPOTrainer
-                    yield prompt, image, metadata
+                    yield prompt_str, image, metadata
                     
 
     my_generator = create_data_generator(train_loader, PROMPT) 
@@ -171,9 +178,9 @@ if __name__ == "__main__":
         wandb.log({
             "validation/before_vs_after": [
                 # Use cached numpy image and cached reward
-                wandb.Image(val_before_img_vis, caption=f"Before (label='{val_meta['label_str']}', r={val_before_reward:.4f})"),
+                wandb.Image(val_before_img_vis, caption=f"Before (label='{val_meta['label_str']}', r={val_before_reward:.2f})"),
                 # Use new PIL image and new reward
-                wandb.Image(after_img_pil, caption=f"After (RL, prompt='{val_prompt}', r={after_reward:.4f})")
+                wandb.Image(after_img_pil, caption=f"After (RL, prompt='{val_prompt}', r={after_reward:.2f})")
             ]
         }, step=wandb_step)
 
@@ -212,13 +219,11 @@ if __name__ == "__main__":
         train_use_8bit_adam=True,    
         
         # --- Critical for Image-to-Image ---
-        # In I2I, some images are naturally "harder" to classify than others.
-        # You don't want to punish the model for a hard image if it improved 
-        # relative to the *last time* it saw that image.
-        # This setting tracks a baseline *per prompt*, so we disable it b/c we care
-        # about a baseline per image. There's a serious possibility this devastates
-        # performance. Leave false, but MAY REVISIT LATER
-        per_prompt_stat_tracking=False,  
+        # Now that prompts are unique (id:X), this calculates a moving average 
+        # of the reward specifically for that image. 
+        # A hard image (reward -10) will eventually have a baseline of -10.
+        # If the model gets -9, that's a +1 advantage!
+        per_prompt_stat_tracking=True,  
         
         # --- Project Info ---
         project_kwargs={

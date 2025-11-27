@@ -82,18 +82,22 @@ class CLIPReward:
 
             # 4. Cosine Similarity -> Logits -> Probs
             logit_scale = self.clip_pipe.model.logit_scale.exp()
+            # gives us raw alignment score
             logits = logit_scale * (image_features @ self.cached_text_embeds.t())
-            probs = logits.softmax(dim=-1)
 
             # 5. Gather specific label confidence
-            labels = labels.to(probs.device)
-            rewards = probs[torch.arange(batch_size, device=probs.device), labels].to(torch.float32)
-            rewards = torch.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+            labels = labels.to(logits.device)
+            rewards = logits[torch.arange(batch_size, device=logits.device), labels].to(torch.float32)
+            
+            # clipping logits
+            rewards = torch.clamp(rewards, -50, 50)
+            if torch.isnan(rewards).any():
+                rewards = torch.nan_to_num(rewards, nan=0.0)
 
         # DDPOTrainer/Accelerate will call .cpu().numpy() on rewards.
         # NumPy does not support bfloat16, so we convert to float32 here.
         rewards = rewards.to(torch.float32)
 
         # Return a tuple (reward_tensor, metadata_dict)
-        print(f"Avg reward for {len(rewards)} images: {rewards.mean()}")
+        print(f"Avg reward for {len(rewards)} images: {rewards.mean():.2f}")
         return rewards, {}
