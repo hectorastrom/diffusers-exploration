@@ -28,16 +28,22 @@ import wandb
 ##################################
 # Constants
 ##################################
-LOADER_BATCH_SIZE = 16 # limited by CPU - faster to fetch many at once
-GPU_BATCH_SIZE = 8 # limited by VRAM
 # TODO: Play around with what prompt works best! Can't be class dependent
 PROMPT = ""
-NUM_WORKERS = 1
+
+# NOTE: The actual number of diffusion steps take is noise_strength *
+# sample_num_steps
 NOISE_STRENGTH = 0.2 # controls adherance to original image (1.0 = pure noise, 0.0 = no change)
 SAMPLE_NUM_STEPS = 50 # diffusion steps to take
-SAMPLE_BATCHES_PER_EPOCH = 8 # num batches to avg reward on per epoch
+
+LOADER_BATCH_SIZE = 16 # limited by CPU - faster to fetch many at once
+GPU_BATCH_SIZE = 6 # limited by VRAM
+GRAD_ACCUM_STEPS = 10 # pseudo batch size (one averaged grad update) = 6 * 10 = 60
+SAMPLE_BATCHES_PER_EPOCH = 260 # num batches to avg reward on per epoch: want 256 total
+
 EPOCHS = 500
 DEVICE = 'cuda'
+NUM_WORKERS = 1
 
 
 if __name__ == "__main__":
@@ -178,13 +184,12 @@ if __name__ == "__main__":
         
         # --- Training (Update Phase) ---
         train_batch_size=GPU_BATCH_SIZE,       # Must be <= sample_batch_size
-        train_gradient_accumulation_steps=1,
+        train_gradient_accumulation_steps=GRAD_ACCUM_STEPS,
         
         # --- Optimizer & LoRA Specifics ---
         # LoRA usually requires a slightly lower LR than full finetuning. 
-        # 3e-4 (default) can be unstable; 1e-4 is safer for LoRA.
-        train_learning_rate=1e-4,       
-        train_use_8bit_adam=True,       # Saves VRAM, virtually no downside.
+        train_learning_rate=1e-5,       
+        train_use_8bit_adam=True,    
         
         # --- Critical for Image-to-Image ---
         # In I2I, some images are naturally "harder" to classify than others.
