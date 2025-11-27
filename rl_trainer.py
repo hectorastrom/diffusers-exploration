@@ -43,6 +43,7 @@ accelerator = Accelerator(
 
 # TODO: Play around with what prompt works best! Can't be class dependent
 PROMPT = ""
+REWARD_VARIANT = "logit_change"
 
 # NOTE: The actual number of diffusion steps take is noise_strength *
 # sample_num_steps
@@ -121,7 +122,7 @@ if __name__ == "__main__":
     ##################################
     # Define reward
     ##################################
-    reward_fn = CLIPReward(class_names=dataset.all_classes, device=DEVICE)
+    reward_fn = CLIPReward(class_names=dataset.all_classes, device=DEVICE, reward_variant=REWARD_VARIANT)
 
     ##################################
     # Build image hook
