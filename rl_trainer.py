@@ -2,7 +2,7 @@
 # @Author  : Hector Astrom
 # @Email   : hastrom@mit.edu
 # @File    : rl_trainer.py
-# Run with `accelerate launch rl_trainer.py``
+# Run with `accelerate launch rl_trainer.py`
 
 """
 Goal: Teach a diffusion model to perceptually enhance images of camouflaged
@@ -26,6 +26,91 @@ import torch
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
+import argparse
+from pprint import pprint
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run DDPO training for image enhancement.")
+    
+    # Dataset and Trainer Constants
+    parser.add_argument(
+        "--prompt", 
+        type=str, 
+        default="ORACLE", 
+        help="The prompt template to use ('ORACLE' uses the ground-truth label)."
+    )
+    parser.add_argument(
+        "--reward_variant", 
+        type=str, 
+        default="logit_change", 
+        help="The variant of the CLIP reward function to use."
+    )
+    parser.add_argument(
+        "--overfit_dset_size", 
+        type=int, 
+        default=128, 
+        help="Number of samples for the training dataset. Set to <= 0 to use the full dataset."
+    )
+    parser.add_argument(
+        "--learning_rate", 
+        type=float, 
+        default=1e-4, 
+        help="Learning rate for the DDPO trainer."
+    )
+    parser.add_argument(
+        "--noise_strength", 
+        type=float, 
+        default=0.4, 
+        help="Controls adherence to the original image (1.0 = pure noise, 0.0 = no change)."
+    )
+    parser.add_argument(
+        "--sample_num_steps", 
+        type=int, 
+        default=50, 
+        help="Diffusion steps to take for sampling."
+    )
+    parser.add_argument(
+        "--use_per_prompt_stat_tracking", 
+        type=lambda x: (str(x).lower() == 'true'), 
+        default=True, 
+        help="Enable per-prompt statistics tracking."
+    )
+    parser.add_argument(
+        "--loader_batch_size", 
+        type=int, 
+        default=128, 
+        help="Batch size for the torch DataLoader (CPU limited)."
+    )
+    parser.add_argument(
+        "--gpu_batch_size", 
+        type=int, 
+        default=8, 
+        help="Batch size per GPU."
+    )
+    parser.add_argument(
+        "--target_global_batch_size", 
+        type=int, 
+        default=256, 
+        help="Target global batch size for training."
+    )
+    parser.add_argument(
+        "--epochs", 
+        type=int, 
+        default=500, 
+        help="Number of training epochs."
+    )
+    parser.add_argument(
+        "--num_workers", 
+        type=int, 
+        default=8, 
+        help="Number of workers for the DataLoader."
+    )
+    
+    return parser.parse_args()
+
+
+# Parse arguments first
+args = parse_args()
 
 ##################################
 # Constants
@@ -41,44 +126,45 @@ accelerator = Accelerator(
     project_config=acc_project_config
 )
 
-# TODO: Play around with what prompt works best! Can't be class dependent
-PROMPT = "ORACLE"
-REWARD_VARIANT = "logit_change"
-OVERFIT_DSET_SIZE = 1000 # num samples to use for testing a small dataset
-
 # NOTE: The actual number of diffusion steps take is noise_strength *
 # sample_num_steps
-NOISE_STRENGTH = 0.5 # controls adherance to original image (1.0 = pure noise, 0.0 = no change)
-SAMPLE_NUM_STEPS = 50 # diffusion steps to take
-USE_PER_PROMPT_STATTRACKING = True
-
-LOADER_BATCH_SIZE = 16 # limited by CPU - faster to fetch many at once
-GPU_BATCH_SIZE = 4 # Hardware limit per A10G
-TARGET_GLOBAL_BATCH_SIZE = 64 # From DDPO paper
-
-total_gpu_throughput = GPU_BATCH_SIZE * accelerator.num_processes
-GRAD_ACCUM_STEPS = max(1, int(TARGET_GLOBAL_BATCH_SIZE / total_gpu_throughput))
+total_gpu_throughput = args.gpu_batch_size * accelerator.num_processes
+GRAD_ACCUM_STEPS = max(1, int(args.target_global_batch_size / total_gpu_throughput))
 # num batches to avg reward on per epoch -> 256 / target_global_batch_size
 SAMPLE_BATCHES_PER_EPOCH = max(GRAD_ACCUM_STEPS, 4) 
 
-EPOCHS = 500
 DEVICE = accelerator.device
-NUM_WORKERS = 4
 
 if __name__ == "__main__":
     if accelerator.is_main_process:
         print(f"Running on {accelerator.num_processes} GPUs.")
-        print(f"Per-device batch: {GPU_BATCH_SIZE}")
+        print(f"Per-device batch: {args.gpu_batch_size}")
         print(f"Total instantaneous batch: {total_gpu_throughput}")
         print(f"Gradient Accumulation steps: {GRAD_ACCUM_STEPS}")
         print(f"Effective Global Batch: {total_gpu_throughput * GRAD_ACCUM_STEPS}")
+        
     ##################################
     # Construct dataset
     ##################################
-    # FIXME: Only using 16 images to try overfitting / reward hacking. If this doesn't work we're cooked
     dataset = build_COD_torch_dataset('train')
-    overfit_dataset = Subset(dataset, torch.arange(OVERFIT_DSET_SIZE))
-    train_loader = DataLoader(overfit_dataset, batch_size=LOADER_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    
+    if args.overfit_dset_size > 0:
+        # Use a subset for testing/overfitting
+        train_dataset = Subset(dataset, torch.arange(args.overfit_dset_size))
+        if accelerator.is_main_process:
+            print(f"Using overfit dataset of size: {args.overfit_dset_size}")
+    else:
+        # Use the full dataset
+        train_dataset = dataset
+        if accelerator.is_main_process:
+            print("Using full training dataset.")
+            
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.loader_batch_size, 
+        shuffle=True, 
+        num_workers=args.num_workers
+    )
     train_loader = accelerator.prepare(train_loader)
 
     # (called as ... = [self.prompt_fn() for _ in range(batch_size)])
@@ -110,14 +196,14 @@ if __name__ == "__main__":
                         prompt_str = prompt
                         
                     # always add id
-                    if USE_PER_PROMPT_STATTRACKING: 
+                    if args.use_per_prompt_stat_tracking: 
                         prompt_str = f"{prompt_str} id:{unique_path}"
                     
                     # prompt + image are analogous to just prompt within DDPOTrainer
                     yield prompt_str, image, metadata
                     
 
-    my_generator = create_data_generator(train_loader, PROMPT) 
+    my_generator = create_data_generator(train_loader, args.prompt) 
 
 
     def my_image_loader():
@@ -129,7 +215,7 @@ if __name__ == "__main__":
     ##################################
     # Define reward
     ##################################
-    reward_fn = CLIPReward(class_names=dataset.all_classes, device=DEVICE, reward_variant=REWARD_VARIANT)
+    reward_fn = CLIPReward(class_names=dataset.all_classes, device=DEVICE, reward_variant=args.reward_variant)
 
     ##################################
     # Build image hook
@@ -218,7 +304,7 @@ if __name__ == "__main__":
         after_reward = rewards[0].item()
         
         after_str = val_prompt
-        if USE_PER_PROMPT_STATTRACKING:
+        if args.use_per_prompt_stat_tracking:
             # I just don't wanna see the big ID think
             after_str = f"{val_prompt.split(' id:')[0]} id:..."
         
@@ -237,7 +323,7 @@ if __name__ == "__main__":
     ##################################
     config = DDPOConfig(
         # --- Logging & General ---
-        num_epochs=EPOCHS,
+        num_epochs=args.epochs,
         log_with= "wandb",               # Highly recommended to visualize the Reward curve
         mixed_precision="fp16",         # Standard for SD 1.5
         allow_tf32=True,
@@ -251,18 +337,18 @@ if __name__ == "__main__":
         # num_train_timesteps = sample_num_steps * train_timestep_fraction 
         # Since we only want to do last NOISE_STRENGTH fraction of inference 
         # steps, we select train_timestep_fraction to be exactly NOISE_STRENGTH
-        train_timestep_fraction=NOISE_STRENGTH, 
-        sample_num_steps=SAMPLE_NUM_STEPS,
-        sample_batch_size=GPU_BATCH_SIZE,           
+        train_timestep_fraction=args.noise_strength, 
+        sample_num_steps=args.sample_num_steps,
+        sample_batch_size=args.gpu_batch_size,           
         sample_num_batches_per_epoch=SAMPLE_BATCHES_PER_EPOCH, # steps * num batches = total samples / epoch
         
         # --- Training (Update Phase) ---
-        train_batch_size=GPU_BATCH_SIZE,       # Must be <= sample_batch_size
+        train_batch_size=args.gpu_batch_size,       # Must be <= sample_batch_size
         train_gradient_accumulation_steps=GRAD_ACCUM_STEPS,
         
         # --- Optimizer & LoRA Specifics ---
         # LoRA usually requires a slightly lower LR than full finetuning. 
-        train_learning_rate=1e-6, # paper used 1e-5
+        train_learning_rate=args.learning_rate, # paper used 1e-5
         train_use_8bit_adam=True,    
         
         # --- Critical for Image-to-Image ---
@@ -290,10 +376,14 @@ if __name__ == "__main__":
         reward_function=reward_fn,
         prompt_function=my_image_loader, # custom prompt function to send images
         sd_pipeline=pipeline,
-        noise_strength=NOISE_STRENGTH,
+        noise_strength=args.noise_strength,
         debug_hook=validation_hook,
         # DDPOTrainer builds its own Accelerator instance
     )
+     
+    # add custom args to wandb config
+    if accelerator.is_main_process:
+        wandb.config.update(vars(args))
 
     ##################################
     # Fix accelerate save_state bug
@@ -318,4 +408,5 @@ if __name__ == "__main__":
     accelerator.free_memory()
     if accelerator.is_main_process:
         print("Commencing training!")
+        pprint(args.__dict__)
     trainer.train()
