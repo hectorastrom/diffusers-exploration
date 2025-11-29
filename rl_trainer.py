@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument(
         "--prompt", 
         type=str, 
-        default="ORACLE", 
+        default="", 
         help="The prompt template to use ('ORACLE' uses the ground-truth label)."
     )
     parser.add_argument(
@@ -52,6 +52,12 @@ def parse_args():
         type=int, 
         default=128, 
         help="Number of samples for the training dataset. Set to <= 0 to use the full dataset."
+    )
+    parser.add_argument(
+        "--image_size", 
+        type=int, 
+        default=512, 
+        help="Size of image in preprocessed dataset passed to SD1.5 (default 512 square)"
     )
     parser.add_argument(
         "--learning_rate", 
@@ -74,25 +80,25 @@ def parse_args():
     parser.add_argument(
         "--use_per_prompt_stat_tracking", 
         type=lambda x: (str(x).lower() == 'true'), 
-        default=True, 
+        default=False, 
         help="Enable per-prompt statistics tracking."
     )
     parser.add_argument(
         "--loader_batch_size", 
         type=int, 
-        default=128, 
+        default=64, 
         help="Batch size for the torch DataLoader (CPU limited)."
     )
     parser.add_argument(
         "--gpu_batch_size", 
         type=int, 
-        default=8, 
+        default=4, 
         help="Batch size per GPU."
     )
     parser.add_argument(
         "--target_global_batch_size", 
         type=int, 
-        default=512, 
+        default=256, 
         help="Target global batch size for training."
     )
     parser.add_argument(
@@ -104,7 +110,7 @@ def parse_args():
     parser.add_argument(
         "--num_workers", 
         type=int, 
-        default=8, 
+        default=4, 
         help="Number of workers for the DataLoader."
     )
     
@@ -149,7 +155,7 @@ if __name__ == "__main__":
     ##################################
     # Construct dataset
     ##################################
-    dataset = build_COD_torch_dataset('train')
+    dataset = build_COD_torch_dataset('train', image_size=args.image_size)
     
     if args.overfit_dset_size > 0:
         # Use a subset for testing/overfitting

@@ -129,23 +129,26 @@ def load_cod10k_lazy() -> DatasetDict:
 # Transforming to torch dataset
 ##################################
 
-tensor_transform = transforms.Compose([
-    # add data augmentation methods
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+def build_transform(image_size):
+    tensor_transform = transforms.Compose([
+        # add data augmentation methods
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+        # 512x512 works best for SD1.5 - but CLIP works with 224x224 images
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+    ])
+    def pytorch_transform_fn(examples):
+        # examples is a dict of lists: {'image': [PIL, ...], 'label': [0, ...]}
+        examples['pixel_values'] = [tensor_transform(img.convert("RGB")) for img in examples['image']]
+        del examples['image'] # don't need for loader
+        return examples
 
-def pytorch_transform_fn(examples):
-    # examples is a dict of lists: {'image': [PIL, ...], 'label': [0, ...]}
-    examples['pixel_values'] = [tensor_transform(img.convert("RGB")) for img in examples['image']]
-    del examples['image'] # don't need for loader
-    return examples
+    return pytorch_transform_fn
 
-def build_COD_torch_dataset(split_name = 'train'):
+def build_COD_torch_dataset(split_name = 'train', image_size=512):
     dataset = load_cod10k_lazy()[split_name]
-    dataset.set_transform(pytorch_transform_fn)
+    dataset.set_transform(build_transform(image_size=image_size))
     
     label_feature = dataset.features['label']
     # Adding some metadata that's helpful
