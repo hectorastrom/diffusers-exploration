@@ -28,6 +28,8 @@ from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
 import argparse
 from pprint import pprint
+import signal
+from datetime import datetime
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run DDPO training for image enhancement.")
@@ -90,7 +92,7 @@ def parse_args():
     parser.add_argument(
         "--target_global_batch_size", 
         type=int, 
-        default=256, 
+        default=512, 
         help="Target global batch size for training."
     )
     parser.add_argument(
@@ -115,9 +117,10 @@ args = parse_args()
 ##################################
 # Constants
 ##################################
+now_str = datetime.now().strftime("%Y%m%d-%H%M%S")
 acc_project_config = ProjectConfiguration(
-    project_dir="./ddpo_logs",
-    logging_dir="./ddpo_logs/runs"
+    project_dir=f"./ddpo_logs/{now_str}/",
+    logging_dir=f"./ddpo_logs/{now_str}/runs",
 )
 # initialize accelerator instance exactly as DDPOTrainer will so they don't conflict
 accelerator = Accelerator(
@@ -360,8 +363,8 @@ if __name__ == "__main__":
         
         # --- Project Info ---
         project_kwargs={
-            "project_dir": "./ddpo_logs",
-            "logging_dir": "./ddpo_logs/runs",
+            "project_dir":f"./ddpo_logs/{now_str}/",
+            "logging_dir":f"./ddpo_logs/{now_str}/runs",
         },
         tracker_project_name="67960-ddpo-classifier-optimization",
     )
@@ -409,4 +412,14 @@ if __name__ == "__main__":
     if accelerator.is_main_process:
         print("Commencing training!")
         pprint(args.__dict__)
+    
+    def sigint_handler(signum, frame):
+        if accelerator.is_main_process:
+            print("\nRecieved interrupt signal - saving final checkpoint...")
+            interrupt_dir = os.path.join(config.project_kwargs["project_dir"], f"checkpoint_INTERRUPT-{now_str}")
+            trainer.accelerator.save_state(output_dir=interrupt_dir)
+        os._exit(0)
+        
+    signal.signal(signal.SIGINT, sigint_handler)
+    
     trainer.train()
